@@ -1025,6 +1025,36 @@ Tool names are `{snake_case_type}_{action}`. Only operations declared in `@Apize
 
 The `McpContextInitializer` bean (provided by the MCP module) re-initialises the apized security context from the `Authorization: Bearer <token>` header of the incoming MCP request, delegating to the registered `UserResolver`. It is only active when a `UserResolver` bean is present.
 
+### Custom HTTP endpoints need explicit MCP tools (Micronaut)
+
+`mcp = true` generates tools **only** for enabled model CRUD actions. A custom Micronaut controller route—such as `POST` or `DELETE /users/{uuid}/permissions/{permission}`—is an HTTP endpoint and is **not** automatically registered as an MCP tool.
+
+Expose custom operations with Micronaut MCP's `@Tool` and `@ToolArg` annotations, preferably in a dedicated `@Singleton` adapter rather than directly on the HTTP controller. Delegate from the adapter to the same generated service or domain logic used by the endpoint:
+
+```java
+import io.micronaut.context.annotation.Singleton;
+import io.micronaut.mcp.annotations.Tool;
+import io.micronaut.mcp.annotations.ToolArg;
+
+@Singleton
+public class UserPermissionMcpTools {
+  private final UserService userService;
+
+  public UserPermissionMcpTools(UserService userService) {
+    this.userService = userService;
+  }
+
+  @Tool(name = "user_add_permission", description = "Grant a permission to a user")
+  public User addPermission(
+      @ToolArg(name = "userId") UUID userId,
+      @ToolArg(name = "permission") String permission) {
+    return userService.addPermission(userId, permission);
+  }
+}
+```
+
+Before invoking Apized-backed logic, initialise the request context for the MCP invocation with `McpContextInitializer.init()` when the integration requires explicit initialisation. This preserves authentication and permission checks; do not bypass the generated service by writing directly to the repository. Choose stable, descriptive tool names and validate tool arguments just as you would validate HTTP input.
+
 ### Disabling MCP for a specific model
 
 ```java
