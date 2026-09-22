@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "apized-tools",
+  "owner": {
+    "name": "Apized"
+  },
+  "description": "Claude Code plugins and skills for the Apized framework.",
+  "plugins": [
+    {
+      "name": "apized",
+      "source": "./plugins/apized",
+      "description": "Guidance for building APIs and working with the Apized JVM framework.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Apized"
+      }
+    }
+  ]
+}
