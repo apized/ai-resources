@@ -21,6 +21,7 @@ Apized is an annotation-driven JVM framework that auto-generates REST API infras
 | [Behaviours](#behaviours) | Lifecycle hooks, ordering, touched fields, original state |
 | [Context Access](#context-access) | `ApizedContext` — request, security, audit, events |
 | [REST Query Features](#rest-query-features) | `?fields=`, `?search=`, pagination |
+| [Linked Models](#linked-models) | Fetch and update relationships via generated endpoints |
 | [Security & Permissions](#security--permissions) | Permission format, UserResolver, `@Owner`, enrichers, filters |
 | [Federation](#federation) | Cross-API references with `@Federation` |
 | [Audit & Events](#audit--events) | Automatic trails, custom events, RabbitMQ config |
@@ -307,6 +308,16 @@ Model drilling works on both GET and PUT. LIST responses return a `Page<T>`:
   "total": 98
 }
 ```
+
+## Linked Models
+
+Before adding a controller for relationship reads or writes, use the generated model endpoints:
+
+- **Fetch dynamically:** request linked fields with model drilling, for example `GET /orders/{id}?fields=id,customer.name,items.product.name`. Apized resolves the requested relationship path and returns it inline; federated links are fetched from the owning service when requested as nested fields.
+- **Update through the root model:** send a partial `PUT` with `?fields=` and the relationship field(s) to change links. `@ManyToMany` additions/removals are handled automatically when that field is included; generated CRUD also applies validation, permissions, audit/events, optimistic locking, and behaviors.
+- **Use the linked model's generated endpoint** when its own attributes must change (for example, `PUT /customers/{id}`); a relationship update changes the association, not the linked model's independent data.
+
+Create a custom controller only when the operation cannot be expressed as generated CRUD, model drilling, or a service/repository extension.
 
 ## Search & Sorting (programmatic)
 
