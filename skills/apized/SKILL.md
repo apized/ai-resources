@@ -541,7 +541,7 @@ class MyPermissionFilter extends ApizedServerFilter {
 
 ## Federation (cross-API references)
 
-Every apized server instance acts as an API gateway. You can reference models that live on a remote service using `@Federation` — the framework will transparently fetch them when requested via model drilling.
+Apized supports nested-read federation/model expansion: a requested federated relationship is resolved and inlined during model drilling. It is not a general API gateway or write-federation facility.
 
 **Important:** The root object of any query must be requested from the server that owns that model directly. Federation only resolves nested references.
 
@@ -553,7 +553,7 @@ Every apized server instance acts as an API gateway. You can reference models th
 @Federated
 public class CatalogItem implements Model {
   private UUID id;
-  private Long catalogItemId;
+  private UUID catalogItemId;
 }
 
 @Entity
@@ -561,11 +561,9 @@ public class CatalogItem implements Model {
 @Apized
 public class Order extends BaseModel {
   // 'catalog' is the federation alias; CatalogItem is the remote type.
-  // The URI template resolves {catalogItemId} from this entity's field.
+  // URI placeholders are resolved from properties on the CatalogItem value.
   @Federation(value = "catalog", type = "CatalogItem", uri = "/items/{catalogItemId}")
   private CatalogItem catalogItem;
-
-  private UUID catalogItemId;
 }
 ```
 
@@ -679,7 +677,7 @@ All are annotated with `@Generated` — do not edit them directly. Use extension
 
 `ProductService` exposes two fetch methods with different semantics:
 - `get(id)` — runs through the full behaviour pipeline (use from controllers or external callers)
-- `find(id)` — bypasses behaviours (use inside behaviours to avoid triggering the pipeline recursively)
+- `find(id)` — bypasses behaviours and delegates directly to the repository; use it only as an internal lookup escape hatch inside behaviours to avoid recursive pipelines. Do not use it for externally observable actions that require GET behaviours or controller/service authorization behaviour.
 - `searchOne(List<SearchTerm> search)` — returns `Optional<T>` for finding a single record by field criteria instead of by UUID (e.g. find a user by email)
 
 ## Triggering the Behaviour Pipeline from Custom Endpoints
@@ -756,7 +754,7 @@ For operations that don't fit CRUD (e.g. login, password reset, token exchange),
 
 Before shipping a custom controller, check:
 
-- **Responses:** Every non-model DTO returned by a Micronaut endpoint, including DTOs nested in `Page<T>`, has both `@Introspected` and `@Serdeable`. Compilation alone does not prove Micronaut can encode the HTTP response.
+- **Responses:** For Micronaut compile-time-serde DTOs, use the project's Micronaut Serde convention (typically `@Serdeable`; add explicit introspection only when required by the project or version). For Spring, use the application's Jackson/Spring MVC DTO configuration. Compilation alone does not prove either engine can encode the HTTP response.
 - **Tests:** Exercise the real HTTP response encoding and assert the response body for each custom route, including nested DTOs and paginated (`Page<T>`) content.
 - **State changes:** Use generated services for model mutations. If the route implements an Apized action, apply `@MicronautBehaviourExecution` or `@SpringBehaviourExecution` explicitly so the required controller-layer behavior pipeline runs; service calls then run service-layer behaviors. Do not write directly through repositories to bypass these pipelines.
 - **Exposure and access:** Restrict `@Apized(operations = ...)` to only the CRUD actions that are intended to be public. Give custom routes an explicit, fail-closed access policy—deny unless the caller has the required permission—and never rely on the development `MemoryUserResolver` in production.
@@ -974,44 +972,27 @@ src/test/resources/
 
 Keep reusable CRUD, login, context, mock-expectation, and response assertions in the framework's built-in steps. Add project steps only for domain workflows or custom endpoints.
 
-### Gradle and runner setup
+### Upstream-supported baseline
 
-The Apized Gradle plugin may already supply the matching test module. If it is not on the test classpath, add it explicitly:
-
-```groovy
-dependencies {
-  testImplementation "org.apized:micronaut-test:$apizedVersion" // Micronaut
-  // testImplementation "org.apized:spring-test:$apizedVersion" // Spring
-}
-```
-
-The Groovy runner is:
+Use the test module that matches the engine and its Cucumber glue. The framework supplies `MicronautTestServer` and `SpringBootTestServer` base classes; begin with those before adding runner-specific framework annotations:
 
 ```groovy
-package com.yourcompany.integration
+// Micronaut
+@CucumberOptions(glue = ['org.apized', 'com.yourcompany'])
+class IntegrationTests extends MicronautTestServer { }
 
-import io.cucumber.junit.Cucumber
-import io.cucumber.junit.CucumberOptions
-import io.micronaut.test.extensions.junit5.annotation.MicronautTest
-import org.junit.runner.RunWith
-
-@MicronautTest
-@RunWith(Cucumber)
-@CucumberOptions(
-  plugin = ['pretty', 'html:target/features'],
-  features = ['src/test/resources/features'],
-  glue = ['org.apized', 'com.yourcompany']
-)
-class IntegrationTests {}
+// Spring
+@CucumberOptions(glue = ['org.apized', 'com.yourcompany'])
+class IntegrationTests extends SpringBootTestServer { }
 ```
 
-`org.apized` in `glue` is mandatory: it discovers the built-in steps and the `MicronautTestServer`/`SpringBootTestServer` hooks that start the embedded server and initialize `IntegrationConfig`. Add the application's package when custom steps are outside `org.apized`. For Spring, use the same Cucumber runner pattern and make `SpringBootTestServer` discoverable through glue; set `SPRING_MAIN_CLASS` to the fully-qualified application class because that server uses it to boot Spring.
+`org.apized` in `glue` discovers the built-in steps and lifecycle hooks. Add the application's package for custom steps. For Spring, set `SPRING_MAIN_CLASS` to the fully-qualified application class because `SpringBootTestServer` uses it to boot Spring.
 
-JUnit Vintage must remain available because `@RunWith(Cucumber)` is a JUnit 4 runner; the Apized test module normally provides it transitively.
+### Project-specific runner recipe
 
-### Java + Micronaut migration recipe
+Java versions, Gradle versions, JUnit Vintage, `@MicronautTest`, and test annotation processors depend on the application's tested toolchain; they are not universal Apized framework requirements. If a project uses a JUnit 4 `@RunWith(Cucumber.class)` runner, retain JUnit Vintage as required by that project's dependency graph. Record the exact configuration as a reproducible project recipe rather than presenting it as framework-wide guidance.
 
-Use Java 21 with Gradle 8.5 or newer. Add the test module and Java annotation processor explicitly so Micronaut can discover concrete Java test beans:
+For example, a Micronaut project that needs concrete Java test beans may require a test annotation processor:
 
 ```gradle
 dependencies {
@@ -1020,28 +1001,7 @@ dependencies {
 }
 ```
 
-Keep the Java runner in the test source set and constrain feature discovery to the module's own `src/test/resources/features` directory:
-
-```java
-package com.yourcompany.integration;
-
-import io.cucumber.junit.Cucumber;
-import io.cucumber.junit.CucumberOptions;
-import io.micronaut.test.extensions.junit5.annotation.MicronautTest;
-import org.junit.runner.RunWith;
-
-@MicronautTest
-@RunWith(Cucumber.class)
-@CucumberOptions(
-    features = "classpath:features",
-    glue = {"org.apized", "com.yourcompany"},
-    plugin = {"pretty", "html:target/features"})
-public class IntegrationTests {}
-```
-
-The `org.apized` glue remains required for framework steps and lifecycle hooks; add the application's package for its custom steps. Do not point `features` at a repository-wide directory, because a module must not accidentally execute another module's feature files.
-
-Concrete Java test beans must use Micronaut bean annotations such as `@Singleton` or `@Controller` and must have generated Micronaut bean metadata. Replace the concrete production resolver—not the `UserResolver` interface—with the test resolver:
+Keep feature discovery scoped to the module's own `src/test/resources/features` directory so it cannot execute another module's feature files. Concrete Java test beans must use Micronaut bean annotations such as `@Singleton` or `@Controller` and need generated Micronaut bean metadata. Replace the concrete production resolver—not the `UserResolver` interface—with the test resolver:
 
 ```java
 import io.micronaut.context.annotation.Replaces;
@@ -1078,11 +1038,11 @@ Keep these endpoints minimal and test-only: return opaque reset or verification 
 
 | Symptom | Check |
 | --- | --- |
-| Cucumber runner or built-in steps are missing | Use `@RunWith(Cucumber.class)`, retain JUnit Vintage, and include `org.apized` plus the application package in `glue`. |
-| Java replacement is ignored or unavailable | Add `testAnnotationProcessor "io.micronaut:micronaut-inject-java"`; annotate concrete test beans with `@Singleton`/`@Controller` so Micronaut generates bean metadata; replace `DBUserResolver.class`, not `UserResolver`. |
+| Cucumber runner or built-in steps are missing | Include `org.apized` plus the application package in `glue`; use the runner supported by the project's Cucumber setup. A JUnit 4 `@RunWith(Cucumber.class)` setup also needs JUnit Vintage. |
+| Java replacement is ignored or unavailable | For Micronaut projects using Java test beans, add `testAnnotationProcessor "io.micronaut:micronaut-inject-java"`; annotate concrete test beans with `@Singleton`/`@Controller` so Micronaut generates bean metadata; replace `DBUserResolver.class`, not `UserResolver`. |
 | `/integration` endpoints return 404 | Keep the test controller in the test source set, annotate it with `@Controller("/integration")`, and extend `MicronautTestController`. |
-| Features from another module run or local features are not found | Use `features = "classpath:features"` and keep this module's files under `src/test/resources/features`. |
-| Gradle or Java startup/processor failures | Run Java 21 with Gradle 8.5 or newer. |
+| Features from another module run or local features are not found | Scope feature discovery to this module's `src/test/resources/features` directory. |
+| Gradle or Java startup/processor failures | Use the Java and Gradle versions verified by the application; capture the working versions in that project's test recipe. |
 
 Optional `src/test/resources/cucumber.properties` for IDE/CLI discovery:
 
@@ -1328,11 +1288,13 @@ Tool names are `{snake_case_type}_{action}`. Only operations declared in `@Apize
 
 The `McpContextInitializer` bean (provided by the MCP module) re-initialises the apized security context from the `Authorization: Bearer <token>` header of the incoming MCP request, delegating to the registered `UserResolver`. It is only active when a `UserResolver` bean is present.
 
-### Custom HTTP endpoints need explicit MCP tools (Micronaut)
+### Custom HTTP endpoints need explicit MCP tools
 
-`mcp = true` generates tools **only** for enabled model CRUD actions. A custom Micronaut controller route—such as `POST` or `DELETE /users/{uuid}/permissions/{permission}`—is an HTTP endpoint and is **not** automatically registered as an MCP tool.
+`mcp = true` generates tools **only** for enabled model CRUD actions. A custom controller route—such as `POST` or `DELETE /users/{uuid}/permissions/{permission}`—is an HTTP endpoint and is **not** automatically registered as an MCP tool.
 
-Expose custom operations with Micronaut MCP's `@Tool` and `@ToolArg` annotations, preferably in a dedicated `@Singleton` adapter rather than directly on the HTTP controller. Delegate from the adapter to the same generated service or domain logic used by the endpoint:
+Delegate custom tools to the same generated service or domain logic used by the endpoint; do not write directly to a repository.
+
+**Micronaut** uses Micronaut MCP's `@Tool` and `@ToolArg` in a dedicated `@Singleton` adapter:
 
 ```java
 import io.micronaut.context.annotation.Singleton;
@@ -1356,7 +1318,31 @@ public class UserPermissionMcpTools {
 }
 ```
 
-Before invoking Apized-backed logic, initialise the request context for the MCP invocation with `McpContextInitializer.init()` when the integration requires explicit initialisation. This preserves authentication and permission checks; do not bypass the generated service by writing directly to the repository. Generated MCP tools catch exceptions and return `"Error: ..."` strings, so MCP clients must treat that response as a failure rather than a successful domain payload. Choose stable, descriptive tool names and validate tool arguments just as you would validate HTTP input.
+**Spring** uses Spring AI's `@Tool` and `@ToolParam` in a `@Component` adapter:
+
+```java
+import org.springframework.ai.tool.annotation.Tool;
+import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.stereotype.Component;
+
+@Component
+public class UserPermissionMcpTools {
+  private final UserService userService;
+
+  public UserPermissionMcpTools(UserService userService) {
+    this.userService = userService;
+  }
+
+  @Tool(name = "user_add_permission", description = "Grant a permission to a user")
+  public User addPermission(
+      @ToolParam(description = "User UUID") UUID userId,
+      @ToolParam(description = "Permission to grant") String permission) {
+    return userService.addPermission(userId, permission);
+  }
+}
+```
+
+Generated MCP tools initialize `ApizedContext` themselves. A hand-written tool that calls Apized services directly must initialize it with `McpContextInitializer.init()`. Ensure the MCP transport supplies a Bearer token and verify authorization with an integration test: initialization without an `Authorization` header does not populate the Apized user. Generated MCP tools catch exceptions and return `"Error: ..."` strings, so MCP clients must treat that response as a failure rather than a successful domain payload. Choose stable, descriptive tool names and validate tool arguments just as you would validate HTTP input.
 
 ### Disabling MCP for a specific model
 
