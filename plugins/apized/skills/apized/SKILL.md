@@ -27,6 +27,7 @@ Apized is an annotation-driven JVM framework that auto-generates REST API infras
 | [Controller Extensions](#controller-extensions) | Override generated actions |
 | [Behaviour Pipeline on Custom Endpoints](#triggering-the-behaviour-pipeline-from-custom-endpoints) | `@MicronautBehaviourExecution` / `@SpringBehaviourExecution` |
 | [Custom Controllers](#custom-controllers) | Fully custom endpoints |
+| [Custom Controller Preflight](#custom-controller-preflight) | Serialization, behavior, and access checks |
 | [Tracing](#tracing-module) | `@Traced` + OpenTelemetry |
 | [Distributed Lock](#distributed-lock-module) | `LockFactory` + ShedLock |
 | [Testing](#test-module) | Cucumber BDD integration tests |
@@ -707,6 +708,15 @@ Reference it via `@Apized(extensions = RouteControllerExtension.class)`. The fra
 ## Custom Controllers
 
 For operations that don't fit CRUD (e.g. login, password reset, token exchange), write a fully custom controller and inject the generated services.
+
+### Custom Controller Preflight
+
+Before shipping a custom controller, check:
+
+- **Responses:** Every non-model DTO returned by a Micronaut endpoint, including DTOs nested in `Page<T>`, has both `@Introspected` and `@Serdeable`. Compilation alone does not prove Micronaut can encode the HTTP response.
+- **Tests:** Exercise the real HTTP response encoding and assert the response body for each custom route, including nested DTOs and paginated (`Page<T>`) content.
+- **State changes:** Use generated services for model mutations. If the route implements an Apized action, apply `@MicronautBehaviourExecution` or `@SpringBehaviourExecution` explicitly so the required behavior pipeline runs; do not write directly through repositories to bypass it.
+- **Exposure and access:** Restrict `@Apized(operations = ...)` to only the CRUD actions that are intended to be public. Give custom routes an explicit, fail-closed access policy—deny unless the caller has the required permission—and never rely on the development `MemoryUserResolver` in production.
 
 **Micronaut:**
 ```java
