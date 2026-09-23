@@ -3,7 +3,7 @@ name: apized
 description: This skill should be used when the user asks to build an API, add a model, add an endpoint, create a new entity, implement a behavior, configure security, add federation, write a repository extension, or work with any part of the apized framework. Activates on questions like "how do I add a new model", "create a REST endpoint", "add a behavior", "configure permissions", or "use @Apized".
 metadata:
   version: 1.1.0
-  last_synced_commit: 43f59a4a0a13da2eb5fda99aff4fe2da4d0f8a2e
+  last_synced_commit: cafad86
 ---
 
 # Apized Framework Guide
@@ -199,15 +199,15 @@ public class ProductValidationBehaviour implements BehaviourHandler<Product> {
   }
 
   @Override
-  public void postCreate(Execution<Product> execution, Product output) {
+  public void postCreate(Execution<Product> execution, Product input, Product output) {
     // runs AFTER create
   }
 
-  // also: preList, postList, preGet, postGet, preUpdate, postUpdate, preDelete, postDelete
+  // also: preList/postList, preGet/postGet, preUpdate/postUpdate, preDelete/postDelete
 }
 ```
 
-`Execution<T>` contains `id` (UUID), `input` (T), and `output` (T).
+`Execution<T>` contains `id` (UUID), `input` (T), and `output` (T). Callback signatures vary by action: create receives `(execution, input)` before and `(execution, input, output)` after; list receives `execution` before and `(execution, Page<T> output)` after; get/delete receive `(execution, id)` before and `(execution, id, output)` after; update receives `(execution, id, input)` before and `(execution, id, input, output)` after. The route target is passed separately as `id`; do not assume it is populated on a partial request body.
 
 ### Touched fields and original state
 
@@ -215,7 +215,8 @@ public class ProductValidationBehaviour implements BehaviourHandler<Product> {
 
 ```java
 @Override
-public void preUpdate(Execution<Order> execution, Order input) {
+public void preUpdate(Execution<Order> execution, UUID id, Order input) {
+  // `id` is the route target; use it when the request body omits the model ID.
   // Check which fields were actually sent in the request
   if (input._getModelMetadata().getTouched().contains("password")) {
     input.setPassword(BCrypt.hashpw(input.getPassword(), BCrypt.gensalt()));
@@ -315,8 +316,9 @@ Model drilling works on both GET and PUT. LIST responses return a `Page<T>`:
 Before adding a controller for relationship reads or writes, use the generated model endpoints:
 
 - **Fetch dynamically:** request linked fields with model drilling, for example `GET /orders/{id}?fields=id,customer.name,items.product.name`. Apized resolves the requested relationship path and returns it inline; federated links are fetched from the owning service when requested as nested fields.
-- **Update through the root model:** send a partial `PUT` with `?fields=` and the relationship field(s) to change links. `@ManyToMany` additions/removals are handled automatically when that field is included; generated CRUD also applies validation, permissions, audit/events, optimistic locking, and behaviors.
-- **Use the linked model's generated endpoint** when its own attributes must change (for example, `PUT /customers/{id}`); a relationship update changes the association, not the linked model's independent data.
+- **Mutate through the root model:** a generated partial `PUT?fields=...` can change a touched relationship and nested linked-model fields in one aggregate request. Apized plans nested create/update/delete work for touched, dirty nested models in the supported JPA relationship cascades: `@ManyToOne`, `@OneToOne`, `@OneToMany`, and the owning side of `@ManyToMany`; owning `@ManyToMany` link additions/removals are handled automatically. Generated CRUD also applies validation, permissions, audit/events, optimistic locking, and behaviors.
+- **Choose the aggregate boundary deliberately:** use the linked model's generated endpoint when it is the clearer independent resource operation, when the root relationship is not part of the requested mutation shape, or when cascading the aggregate update is not intended. Do not promise arbitrary cross-aggregate mutation.
+- **Federation is read-only from this API:** model drilling can enrich a federated field on a read, but local generated relationship mutation does not forward updates to the remote service. Mutate federated resources through their owning service/API.
 
 Create a custom controller only when the operation cannot be expressed as generated CRUD, model drilling, or a service/repository extension.
 
@@ -325,9 +327,9 @@ Create a custom controller only when the operation cannot be expressed as genera
 When building a frontend against an Apized backend, consume the generated API before requesting a bespoke endpoint:
 
 - **Lists and detail:** use generated `GET` endpoints with `page`, `pageSize`, `search`, `sort`, and `fields`; render list data from `Page.content` and use `total`, `totalPages`, and `page` for pagination.
-- **Read shape:** request only the fields a screen needs and drill into relationships in the same request (for example, `?fields=id,name,customer.name`) to avoid client-side fan-out. Treat omitted fields as not requested, not necessarily `null`.
+- **Read shape:** request only the fields a screen needs and drill into relationships in the same request (for example, `?fields=id,name,customer.name`) to avoid client-side fan-out. With a `fields` selection, omitted fields were not requested; without one, generated model responses include their normal serializable fields, subject to access annotations.
 - **Mutations:** use generated `POST`, partial `PUT?fields=...`, and `DELETE` for enabled operations. Include the model `version` returned by the API when protecting against conflicting edits; surface validation and authorization failures rather than assuming the UI is the authority.
-- **Relationships:** update links through the root model's generated partial `PUT`, and update a linked model's own attributes through its generated endpoint. Do not add a backend-for-frontend route solely to expand or mutate a normal Apized relationship.
+- **Relationships:** for supported local JPA relationships, a root-model partial `PUT?fields=...` can update the association and touched nested linked-model fields. Use a linked model's own endpoint for independent-resource operations; mutate federated resources through their owning API. Do not add a backend-for-frontend route solely to expand or mutate a normal Apized relationship.
 - **Access:** send the authenticated bearer token (or configured cookie), treat unauthorized/forbidden responses as authoritative, and hide or disable controls only as a UX optimization—not as the access-control boundary.
 
 Agree a custom endpoint only for a real domain operation that generated CRUD, model drilling, search/sort, and extensions cannot express.
@@ -542,20 +544,32 @@ Every apized server instance acts as an API gateway. You can reference models th
 ### Declaring a federated field
 
 ```java
+@Getter @Setter @NoArgsConstructor
+@Serdeable
+@Federated
+public class CatalogItem implements Model {
+  private UUID id;
+  private Long catalogItemId;
+}
+
 @Entity
 @Getter @Setter
 @Apized
 public class Order extends BaseModel {
-  // 'catalog' is the federation alias; Item is the remote type
-  // uri template resolves {catalogItemId} from the field of that name on this entity
-  @Federation(value = "catalog", type = "Item", uri = "/items/{catalogItemId}")
-  private Item catalogItem;
+  // 'catalog' is the federation alias; CatalogItem is the remote type.
+  // The URI template resolves {catalogItemId} from this entity's field.
+  @Federation(value = "catalog", type = "CatalogItem", uri = "/items/{catalogItemId}")
+  private CatalogItem catalogItem;
 
   private UUID catalogItemId;
 }
 ```
 
-When a client requests `?fields=catalogItem.name`, apized calls the remote catalog service to resolve `Item` and inlines the result.
+A federated reference type must be a `Model` and use `@Federated` (plus framework serialization annotations such as `@Serdeable` in Micronaut). It is not an `@Entity`/`@Apized` local resource.
+
+When a client requests `?fields=catalogItem.name`, apized calls the remote catalog service to resolve `CatalogItem` and inlines the result.
+
+Federation currently resolves reads only. A local generated `POST`/`PUT`/`DELETE` does not forward a federated field's mutations to the remote service; send those requests to the owning service instead.
 
 ### Configuration
 
@@ -711,9 +725,10 @@ This ensures any behaviours registered for `Trip` / `CONTROLLER` / `LIST` fire a
 
 ## Controller Extensions
 
-Use `@Apized.Extension(layer = Layer.CONTROLLER)` to override a generated action (e.g. replace hard-delete with soft-delete):
+Use `@Apized.Extension(layer = Layer.CONTROLLER)` to override a generated action. The extension must be a concrete bean (`@Singleton` in Micronaut or `@Component` in Spring); the generated controller injects and delegates to it:
 
 ```java
+@Singleton   // @Component for Spring
 @Apized.Extension(layer = Layer.CONTROLLER)
 public class RouteControllerExtension {
   @Inject RouteService routeService;
@@ -739,7 +754,7 @@ Before shipping a custom controller, check:
 
 - **Responses:** Every non-model DTO returned by a Micronaut endpoint, including DTOs nested in `Page<T>`, has both `@Introspected` and `@Serdeable`. Compilation alone does not prove Micronaut can encode the HTTP response.
 - **Tests:** Exercise the real HTTP response encoding and assert the response body for each custom route, including nested DTOs and paginated (`Page<T>`) content.
-- **State changes:** Use generated services for model mutations. If the route implements an Apized action, apply `@MicronautBehaviourExecution` or `@SpringBehaviourExecution` explicitly so the required behavior pipeline runs; do not write directly through repositories to bypass it.
+- **State changes:** Use generated services for model mutations. If the route implements an Apized action, apply `@MicronautBehaviourExecution` or `@SpringBehaviourExecution` explicitly so the required controller-layer behavior pipeline runs; service calls then run service-layer behaviors. Do not write directly through repositories to bypass these pipelines.
 - **Exposure and access:** Restrict `@Apized(operations = ...)` to only the CRUD actions that are intended to be public. Give custom routes an explicit, fail-closed access policy—deny unless the caller has the required permission—and never rely on the development `MemoryUserResolver` in production.
 
 **Micronaut:**
@@ -840,7 +855,7 @@ public class Department extends BaseModel {
 }
 ```
 
-This generates endpoints like `GET /organizations/{organization}/departments/{id}`.
+This generates endpoints like `GET /organizations/{organizationId}/departments/{id}`.
 
 ### Behaviour on the child
 
@@ -881,7 +896,7 @@ Reference it via `@Apized(extensions = DepartmentRepositoryExtension.class)` on 
 
 ## Tracing Module (`micronaut-tracing` / `spring-tracing`)
 
-Apply `@Traced` to any method or class to create an OpenTelemetry span automatically:
+Apply `@Traced` to a method (or a class in Micronaut) to create an OpenTelemetry span automatically:
 
 ```java
 // Simple usage — span name defaults to "ClassName::methodName"
@@ -1337,7 +1352,7 @@ public class UserPermissionMcpTools {
 }
 ```
 
-Before invoking Apized-backed logic, initialise the request context for the MCP invocation with `McpContextInitializer.init()` when the integration requires explicit initialisation. This preserves authentication and permission checks; do not bypass the generated service by writing directly to the repository. Choose stable, descriptive tool names and validate tool arguments just as you would validate HTTP input.
+Before invoking Apized-backed logic, initialise the request context for the MCP invocation with `McpContextInitializer.init()` when the integration requires explicit initialisation. This preserves authentication and permission checks; do not bypass the generated service by writing directly to the repository. Generated MCP tools catch exceptions and return `"Error: ..."` strings, so MCP clients must treat that response as a failure rather than a successful domain payload. Choose stable, descriptive tool names and validate tool arguments just as you would validate HTTP input.
 
 ### Disabling MCP for a specific model
 
