@@ -22,6 +22,7 @@ Apized is an annotation-driven JVM framework that auto-generates REST API infras
 | [Context Access](#context-access) | `ApizedContext` — request, security, audit, events |
 | [REST Query Features](#rest-query-features) | `?fields=`, `?search=`, pagination |
 | [Linked Models](#linked-models) | Fetch and update relationships via generated endpoints |
+| [Frontend Consumers](#frontend-consumers) | Consume generated CRUD safely and efficiently |
 | [Security & Permissions](#security--permissions) | Permission format, UserResolver, `@Owner`, enrichers, filters |
 | [Federation](#federation) | Cross-API references with `@Federation` |
 | [Audit & Events](#audit--events) | Automatic trails, custom events, RabbitMQ config |
@@ -318,6 +319,18 @@ Before adding a controller for relationship reads or writes, use the generated m
 - **Use the linked model's generated endpoint** when its own attributes must change (for example, `PUT /customers/{id}`); a relationship update changes the association, not the linked model's independent data.
 
 Create a custom controller only when the operation cannot be expressed as generated CRUD, model drilling, or a service/repository extension.
+
+## Frontend Consumers
+
+When building a frontend against an Apized backend, consume the generated API before requesting a bespoke endpoint:
+
+- **Lists and detail:** use generated `GET` endpoints with `page`, `pageSize`, `search`, `sort`, and `fields`; render list data from `Page.content` and use `total`, `totalPages`, and `page` for pagination.
+- **Read shape:** request only the fields a screen needs and drill into relationships in the same request (for example, `?fields=id,name,customer.name`) to avoid client-side fan-out. Treat omitted fields as not requested, not necessarily `null`.
+- **Mutations:** use generated `POST`, partial `PUT?fields=...`, and `DELETE` for enabled operations. Include the model `version` returned by the API when protecting against conflicting edits; surface validation and authorization failures rather than assuming the UI is the authority.
+- **Relationships:** update links through the root model's generated partial `PUT`, and update a linked model's own attributes through its generated endpoint. Do not add a backend-for-frontend route solely to expand or mutate a normal Apized relationship.
+- **Access:** send the authenticated bearer token (or configured cookie), treat unauthorized/forbidden responses as authoritative, and hide or disable controls only as a UX optimization—not as the access-control boundary.
+
+Agree a custom endpoint only for a real domain operation that generated CRUD, model drilling, search/sort, and extensions cannot express.
 
 ## Search & Sorting (programmatic)
 
