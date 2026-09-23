@@ -108,13 +108,13 @@ public class Product extends BaseModel {
 ```
 
 **Rules:**
-- Extend `BaseModel` (provides `id` UUID PK, `version` Long for optimistic locking — if the client sends it the update will fail if stale (useful for sensitive operations like decrementing a stock counter); if omitted the framework applies a request-scoped optimistic lock, `createdBy`, `createdAt`, `lastUpdatedBy`, `lastUpdatedAt`, `metadata` JSON-like Map/List for unstructured data)
+- Extend `BaseModel` (provides an `id` UUID primary key, a JPA `@Version` field for optimistic concurrency, audit fields, and a JSON-like `metadata` map). When a client supplies `version` in an update body, normal JPA optimistic-lock checking can detect stale state; when it is omitted, the deserializer preserves the currently loaded entity version. There is no additional framework-level optimistic lock.
 - Annotate with `@Entity` (JPA) and `@Apized`
 - Use Lombok `@Getter @Setter`
 - `layers` controls which classes are generated. Default: all three (`CONTROLLER`, `SERVICE`, `REPOSITORY`). Omit a layer to suppress it — e.g. `layers = {Layer.SERVICE, Layer.REPOSITORY}` generates no HTTP endpoints, useful for internal-only models.
 - `operations` controls which CRUD endpoints are exposed. Default: all five (`LIST`, `GET`, `CREATE`, `UPDATE`, `DELETE`).
 - Request bodies for `CREATE` and `UPDATE` are automatically validated with Bean Validation (`@Valid`). Annotate model fields with `@NotBlank`, `@NotNull`, `@Size`, etc. as needed.
-- `@ManyToMany` relationships are managed automatically — the framework generates `add/remove` methods for the join table and calls them when the relationship field is included in a PUT request. No custom code needed.
+- An owning-side `@ManyToMany` relationship (`mappedBy` absent) is reconciled automatically when that relationship is included in the create/update body: Apized computes join-table additions and removals from the submitted collection. Verify ownership and cascade configuration before relying on this: `CascadeType.ALL`/`REMOVE` can delete removed related models, and `@OneToMany(orphanRemoval = true)` can delete detached children.
 - `mcp` — when `true` (default), generates a `{Type}McpTools` bean that exposes all enabled CRUD operations as MCP tool calls. Set `mcp = false` to suppress generation for a specific model. Requires `micronaut-mcp` / `spring-mcp` on the classpath to activate.
 - `extensions` accepts an array — pass multiple extension classes: `extensions = {RepoExtension.class, ServiceExtension.class}`.
 - Use `scope` in `@Apized` to define the parent model and establish a hierarchy (used for endpoint URL nesting and integration test tooling):
@@ -124,6 +124,8 @@ public class Product extends BaseModel {
 @Apized(scope = Organization.class)
 public class Department extends BaseModel { ... }
 ```
+
+Generated controller routes use the pluralized, lower-camel model name: `GET /products`, `GET /products/{id}`, `POST /products`, `PUT /products/{id}`, and `DELETE /products/{id}` for enabled operations. A scoped `Department` under `Organization` is generated under `/organizations/{organizationId}/departments`. Although `scope` is declared as an array and the processor computes candidate paths, the current controller templates bind only the first generated path; do not rely on multiple scope alternatives being exposed simultaneously.
 
 ## Service Extensions
 
@@ -285,13 +287,13 @@ ApizedContext.getSerde()      // internal framework use only — do not use in a
 
 ## REST Query Features
 
-All generated endpoints support these query parameters:
+Generated endpoints support response field selection through `?fields=`. The generated LIST route additionally supports `page`, `pageSize`, `search`, and `sort`; those collection-query parameters are not generated for GET, CREATE, UPDATE, or DELETE.
 
 | Feature | Syntax | Example |
 |---|---|---|
 | Field filtering | `?fields=f1,f2` | `?fields=name` |
 | Model drilling | `?fields=f1,rel.f2` | `?fields=name,employees.name` |
-| Partial PUT | `?fields=f1` + partial body | send only changed fields |
+| Partial update | `PUT /{id}` + partial request body | `PUT /products/{id}` with `{ "name": "New name" }` |
 | Search | `?search=field<op>value` | `?search=name=Org%20A` |
 | Nested search | `?search=rel.field<op>value` | `?search=employee.name~=Sen` |
 | Pagination | `?page=1&pageSize=50` | page is 1-based; default pageSize is 50, capped by `maxPageSize` on `@Apized` |
@@ -299,7 +301,9 @@ All generated endpoints support these query parameters:
 
 Search operators for `?search=`: `=` (eq), `!=` (ne), `~=` (like/contains), `>` (gt), `>=` (gte), `<` (lt), `<=` (lte), `<>` (in — e.g. `status<>ACTIVE,PENDING`), `<!>` (nin — e.g. `status<!>DRAFT,CANCELLED`). Multiple search terms are comma-separated.
 
-Model drilling works on both GET and PUT. LIST responses return a `Page<T>`:
+Model drilling and response field selection apply to generated responses, including GET and PUT. For updates, the JSON body—not `?fields=`—determines the fields considered changed.
+
+LIST responses return a `Page<T>`:
 
 ```json
 {
@@ -316,7 +320,7 @@ Model drilling works on both GET and PUT. LIST responses return a `Page<T>`:
 Before adding a controller for relationship reads or writes, use the generated model endpoints:
 
 - **Fetch dynamically:** request linked fields with model drilling, for example `GET /orders/{id}?fields=id,customer.name,items.product.name`. Apized resolves the requested relationship path and returns it inline; federated links are fetched from the owning service when requested as nested fields.
-- **Mutate through the root model:** a generated partial `PUT?fields=...` can change a touched relationship and nested linked-model fields in one aggregate request. Apized plans nested create/update/delete work for touched, dirty nested models in the supported JPA relationship cascades: `@ManyToOne`, `@OneToOne`, `@OneToMany`, and the owning side of `@ManyToMany`; owning `@ManyToMany` link additions/removals are handled automatically. Generated CRUD also applies validation, permissions, audit/events, optimistic locking, and behaviors.
+- **Mutate through the root model:** send `PUT /{id}` with relationship fields in the JSON body. Apized derives touched fields from the body, reconciles applicable associations, and can recursively create/update touched nested non-federated models. `?fields=` controls the serialized response shape; it does not select body fields for mutation. Generated CRUD also applies validation, root-model permission checks, audit/events, optimistic locking, and behaviors.
 - **Choose the aggregate boundary deliberately:** use the linked model's generated endpoint when it is the clearer independent resource operation, when the root relationship is not part of the requested mutation shape, or when cascading the aggregate update is not intended. Do not promise arbitrary cross-aggregate mutation.
 - **Federation is read-only from this API:** model drilling can enrich a federated field on a read, but local generated relationship mutation does not forward updates to the remote service. Mutate federated resources through their owning service/API.
 
@@ -328,8 +332,8 @@ When building a frontend against an Apized backend, consume the generated API be
 
 - **Lists and detail:** use generated `GET` endpoints with `page`, `pageSize`, `search`, `sort`, and `fields`; render list data from `Page.content` and use `total`, `totalPages`, and `page` for pagination.
 - **Read shape:** request only the fields a screen needs and drill into relationships in the same request (for example, `?fields=id,name,customer.name`) to avoid client-side fan-out. With a `fields` selection, omitted fields were not requested; without one, generated model responses include their normal serializable fields, subject to access annotations.
-- **Mutations:** use generated `POST`, partial `PUT?fields=...`, and `DELETE` for enabled operations. Include the model `version` returned by the API when protecting against conflicting edits; surface validation and authorization failures rather than assuming the UI is the authority.
-- **Relationships:** for supported local JPA relationships, a root-model partial `PUT?fields=...` can update the association and touched nested linked-model fields. Use a linked model's own endpoint for independent-resource operations; mutate federated resources through their owning API. Do not add a backend-for-frontend route solely to expand or mutate a normal Apized relationship.
+- **Mutations:** use generated `POST`, `PUT`, and `DELETE` for enabled operations. For a partial update, send only the changed properties in the body; use `?fields=` only when a restricted or drilled response is needed. Include the model `version` returned by the API when protecting against conflicting edits; surface validation and authorization failures rather than assuming the UI is the authority.
+- **Relationships:** include a normal, non-federated relationship in the root `PUT` body to reconcile links and, where supported by the mapping, create or update nested related models. Use the related model endpoint when it is an independent domain operation or should not cascade from the root. Mutate federated resources through their owning API. Do not add a backend-for-frontend route solely to expand or mutate a normal Apized relationship.
 - **Access:** send the authenticated bearer token (or configured cookie), treat unauthorized/forbidden responses as authoritative, and hide or disable controls only as a UX optimization—not as the access-control boundary.
 
 Agree a custom endpoint only for a real domain operation that generated CRUD, model drilling, search/sort, and extensions cannot express.
@@ -363,7 +367,7 @@ Permission format: `{slug}.{entity}.{action}[.{id}][.{field}][.{value}]` — wil
 | `sample.organization.update.*.name` | Can update name of any organization |
 | `sample.address.update.*.country.PT` | Can update any address country to PT only |
 
-Permissions are evaluated for **every affected model and field** in a request (including nested models via model drilling).
+Generated CRUD permission checks run at the service layer for the action model, with field/value checks for touched fields on writes. Do not assume model drilling independently authorizes every nested related model or field: protect sensitive relation fields explicitly (for example, with serialization annotations, dedicated DTOs/endpoints, or additional authorization logic) and test drilled responses with least-privilege users.
 
 **Configuration:**
 ```yaml
@@ -378,9 +382,7 @@ apized:
 
 **Authentication:** `Authorization: Bearer <token>` header, or cookie (name set by `apized.cookie`).
 
-**UserResolver:** Implement `UserResolver` to replace the default `MemoryUserResolver`. It builds `User` + `Role` objects for each request. The `User` object accepts a `metadata` map for carrying extra data (e.g. external system IDs) through the request lifecycle.
-
-> **Default (dev only):** `MemoryUserResolver` is active when no custom `UserResolver` is registered. It ignores the token and always returns a hardcoded admin user with `permissions: ["*"]`. Replace it in production.
+**UserResolver:** A `UserResolver` supplies the request user. The framework ships `MemoryUserResolver` as a component; it ignores the token and returns one administrator with `["*"]`. Because its presence also activates the framework security filter, an application that leaves this resolver active effectively grants full access to every non-excluded request. Replace or exclude it explicitly in every deployed environment and verify anonymous, malformed-token, and forbidden requests at HTTP level. The `User` object accepts a `metadata` map for carrying extra data (for example, external system IDs) through the request lifecycle.
 
 **Micronaut:**
 ```java
@@ -419,6 +421,8 @@ public class DBUserResolver implements UserResolver {
   }
 }
 ```
+
+> **Deployment requirement:** Ensure exactly one effective resolver is selected by the DI container. In Micronaut, replace `MemoryUserResolver.class`; in Spring, make the production resolver primary or explicitly exclude the memory resolver. Test that an invalid or missing token does not resolve to an administrator.
 
 You can also execute code as a specific user via `userResolver.runAs()`:
 
