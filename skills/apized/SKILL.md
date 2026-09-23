@@ -2,7 +2,7 @@
 name: apized
 description: This skill should be used when the user asks to build an API, add a model, add an endpoint, create a new entity, implement a behavior, configure security, add federation, write a repository extension, or work with any part of the apized framework. Activates on questions like "how do I add a new model", "create a REST endpoint", "add a behavior", "configure permissions", or "use @Apized".
 metadata:
-  version: 1.0.0
+  version: 1.1.0
   last_synced_commit: 43f59a4a0a13da2eb5fda99aff4fe2da4d0f8a2e
 ---
 
@@ -901,105 +901,280 @@ Requires a `shedlock` table in the database (created by your Flyway/Liquibase mi
 
 ## Test Module (`micronaut-test` / `spring-test`)
 
-The test module provides a Cucumber BDD integration testing framework that understands apized model hierarchies and automatically builds correct nested URLs.
+Use the Apized test module for HTTP-level Cucumber integration tests. It boots the real application, discovers generated model services, sends requests with REST Assured, understands `@Apized(scope = ...)` hierarchies, and resets the database and registered service mocks before each scenario. Prefer a real disposable database over repository mocks; the Auth service is the reference pattern.
 
-### Setup
+### Recommended test layout
 
-**Micronaut:**
-```groovy
-// build.gradle
-dependencies {
-  testImplementation "org.apized:micronaut-test:$apizedVersion"
-}
-
-@CucumberOptions(glue = ['org.apized', 'com.yourcompany'])
-class IntegrationTests extends MicronautTestServer { }
+```text
+src/test/groovy/com/yourcompany/integration/
+  IntegrationTests.groovy
+  TestController.groovy                 # only when tests need internal state
+  mocks/TestUserResolver.groovy
+  mocks/ExternalClientMock.groovy
+  steps/ProductSteps.groovy             # only domain-specific language
+src/test/resources/
+  application-test.yml
+  cucumber.properties                   # optional IDE/CLI defaults
+  features/<domain>/*.feature
+  payloads/...                           # optional request/response fixtures
 ```
+
+Keep reusable CRUD, login, context, mock-expectation, and response assertions in the framework's built-in steps. Add project steps only for domain workflows or custom endpoints.
+
+### Gradle and runner setup
+
+The Apized Gradle plugin may already supply the matching test module. If it is not on the test classpath, add it explicitly:
+
+```groovy
+dependencies {
+  testImplementation "org.apized:micronaut-test:$apizedVersion" // Micronaut
+  // testImplementation "org.apized:spring-test:$apizedVersion" // Spring
+}
+```
+
+The runner used by Auth is:
+
+```groovy
+package com.yourcompany.integration
+
+import io.cucumber.junit.Cucumber
+import io.cucumber.junit.CucumberOptions
+import io.micronaut.test.extensions.junit5.annotation.MicronautTest
+import org.junit.runner.RunWith
+
+@MicronautTest
+@RunWith(Cucumber)
+@CucumberOptions(
+  plugin = ['pretty', 'html:target/features'],
+  features = ['src/test/resources/features'],
+  glue = ['org.apized', 'com.yourcompany']
+)
+class IntegrationTests {}
+```
+
+`org.apized` in `glue` is mandatory: it discovers the built-in steps and the `MicronautTestServer`/`SpringBootTestServer` hooks that start the embedded server and initialize `IntegrationConfig`. Add the application's package when custom steps are outside `org.apized`. For Spring, use the same Cucumber runner pattern and make `SpringBootTestServer` discoverable through glue; set `SPRING_MAIN_CLASS` to the fully-qualified application class because that server uses it to boot Spring.
+
+JUnit Vintage must remain available because `@RunWith(Cucumber)` is a JUnit 4 runner; the Apized test module normally provides it transitively.
+
+Optional `src/test/resources/cucumber.properties` for IDE/CLI discovery:
+
+```properties
+cucumber.glue=org.apized,com.yourcompany
+cucumber.plugin=pretty
+```
+
+Run all tests with `./gradlew test` (or `./gradlew :server:test` in a multi-project build). To support CI/test partitioning, a project can pass exclusions into Gradle and map them to `test.exclude(...)`, as Auth does with `-PexcludeTests=...`.
+
+### Test profile and real database
+
+Use the `test` profile and a random port. For Micronaut with PostgreSQL Testcontainers JDBC:
+
+```yaml
+# src/test/resources/application-test.yml
+datasources:
+  default:
+    url: jdbc:tc:postgresql:16:///app
+    driverClassName: org.testcontainers.jdbc.ContainerDatabaseDriver
+    username: test
+    password: test
+
+micronaut:
+  server:
+    port: 0
+
+endpoints:
+  all:
+    port: 0
+    enabled: false
+```
+
+Use the same database family as production so migrations, constraints, native column types, and queries are exercised. The framework test controller truncates non-Flyway tables between scenarios for H2, MySQL, PostgreSQL, Oracle, and SQL Server, then re-runs startup initialization. Do not depend on records created by another scenario; put shared setup in `Background` or startup fixtures.
+
+### Authentication fixture
+
+For a static set of users, replace the application's resolver and extend the framework mock:
 
 ```groovy
 @Singleton
-@Replaces(AbstractMicronautUserResolverMock)
+@Replaces(DBUserResolver)
 class TestUserResolver extends AbstractMicronautUserResolverMock {
   @Override
   Map<String, User> getKnownUsers() {
-    return [
-      "admin": User.builder().permissions(["*"]).build(),
-      "alice": User.builder().permissions(["myapp.product.list"]).build(),
+    [
+      administrator: new User(permissions: ['*']),
+      alice: new User(permissions: ['myapp.product.list'])
     ]
   }
 }
 ```
 
-**Spring:**
-```groovy
-// build.gradle
-dependencies {
-  testImplementation "org.apized:spring-test:$apizedVersion"
-}
+Use `@Component`/`@Primary` and `AbstractSpringUserResolverMock` for Spring. The base mock assigns missing UUIDs and publishes the alias map into the integration context, so `Given I login as alice` obtains a token for that exact test user.
 
-@CucumberOptions(glue = ['org.apized', 'com.yourcompany'])
-class IntegrationTests extends SpringBootTestServer { }
-```
+If users are themselves persisted during scenarios, follow Auth's dynamic pattern instead of keeping only a static map:
 
-```groovy
-@Component
-@Primary
-class TestUserResolver extends AbstractSpringUserResolverMock {
-  @Override
-  Map<String, User> getKnownUsers() {
-    return [
-      "admin": User.builder().permissions(["*"]).build(),
-      "alice": User.builder().permissions(["myapp.product.list"]).build(),
-    ]
-  }
-}
-```
+1. Replace the production resolver, but inject/delegate to production conversion logic where appropriate.
+2. Keep both alias-to-user and UUID-to-user maps in the inherited mock.
+3. Register seeded users after application startup.
+4. Register newly created users in a test-only `AFTER CREATE` service behaviour so later steps can immediately `login as <alias>`.
+5. Resolve database users first, then fall back to the inherited in-memory users/anonymous user.
+
+This keeps authentication realistic while making scenario-created identities usable. Reset `inferredPermissions` per resolution; never let inferred permissions leak between requests or scenarios.
 
 ### Built-in Cucumber steps
 
 ```gherkin
-# Auth
-Given I login as admin
-
-# Context — set known IDs for scoped models
+# Authentication and scoped URL context
+Given I login as administrator
 Given the context is
-  | organization | <orgId> |
+  | organization | ${organization.id} |
 
-# CRUD
-Given I list the products
-Given I list the products as myList
-Given I create a product with
-  | name  | Widget |
-  | price | 9.99   |
-Given I create a product as myProduct with
-  | name  | Widget |
-Given I get a product with id {id}
-Given I update a product with id {id} with
-  | name  | Updated Widget |
-Given I delete a product with id {id}
+# Generated CRUD; aliases save responses for later interpolation/assertion
+When I list the products
+When I list the products as productPage
+When I create an empty product
+When I create a product as widget with
+  | name     | Widget                   |
+  | category | [ id: '${category.id}' ] |
+When I get a product with id ${widget.id} as fetchedWidget
+When I update a product with id ${widget.id} with
+  | name | Updated Widget |
+When I delete a product with id ${widget.id}
 
-# Field expansion (model drilling)
-Given the responses are expanded to contain employees.name
+# Field expansion/model drilling and request headers
+Given the responses are expanded to contain category.name
+Given the request contains header X-Reason with value "integration test"
 
-# Assertions
+# Status and body assertions
 Then the request succeeds
 Then the request fails
+Then the productPage request succeeds
 Then the response contains 3 elements
-Then the response contains
-  | name  | Widget |
 Then the response element 0 contains
-  | name  | Widget |
+  | name | Widget |
 Then the response contains element with
-  | name  | Widget |
-Then the response path "content[0].name" contains Widget
-Then the response matches products/widget.json   # loads /payloads/products/widget.json
+  | name | Widget |
+Then the response does not contain element with
+  | name | Deleted Widget |
+Then the response path "errors" contains element with
+  | field   | name             |
+  | message | must not be null |
+Then the response path "errors" contains 2 elements
+Then the response matches products/widget.json
 ```
 
-Values in DataTable cells support:
-- `{lastId}` / `{myAlias.id}` — reference IDs from previous responses
-- `/regex/` — regex match in assertions
-- `true` / `false` — parsed as boolean
-- Numeric strings — parsed as numbers
+Important expression rules:
+
+- Refer to stored values with `${alias.id}`, `${alias.roles[0]}`, etc. Do not use `<alias.id>` or `{alias.id}` outside a Scenario Outline example placeholder.
+- DataTable values are evaluated as Groovy-like literals, allowing lists/maps such as `[ '${role.id}' ]` and `[ [ id: '${role.id}' ] ]`.
+- Use `/regex/` for a full regular-expression match; `/.*Not allowed.*/` is typical for variable error text.
+- Booleans and numeric strings are compared as their response types.
+- Response paths are dot-separated (`errors.0.message`, `content.0.name`), not JSONPath bracket syntax.
+- `_` means the current scalar/object, useful when asserting primitive lists.
+- `response matches file.json` loads `/payloads/file.json` from the test classpath.
+
+For validation matrices, prefer `Scenario Outline` with explicit input, expected status, response path, field, and message columns. Cover success boundaries as well as null, too-short/long, invalid enum, duplicate-key, and authorization failures.
+
+### Custom steps for custom endpoints
+
+Extend `AbstractSteps`, initialize the shared runner/context once, use `testRunner.getClient(context)`, evaluate URLs and payload values through `context.eval(...)`, and always record the result with `context.addResponse(...)` so built-in assertions continue to work:
+
+```groovy
+class ProductSteps extends AbstractSteps {
+  static TestRunner testRunner
+  static IntegrationContext context
+
+  @BeforeAll
+  static void setup() {
+    testRunner = IntegrationConfig.testRunner
+    context = testRunner.context
+  }
+
+  @When('^I activate product ([^\\s]+)$')
+  void activate(String id) {
+    Response response = testRunner.getClient(context)
+      .post(context.eval("/products/$id/activation").toString())
+
+    context.addResponse(
+      'product',
+      (response.statusCode().intdiv(100) == 2),
+      response.asString(),
+      null
+    )
+  }
+}
+```
+
+Use a helper like Auth's `executeAs(user, closure)` for fixture creation that temporarily switches identity, and restore the old token in `finally`. Keep feature text business-oriented; do not duplicate generic HTTP mechanics in every project step.
+
+For stateful protocols (for example passkeys), keep simulator state as instance fields so it is per scenario, while the framework runner/context stay static. Store parsed intermediate responses by alias and use the same simulator/key material throughout the scenario.
+
+### External service mocks
+
+Replace the real client/adapter with a bean that extends `AbstractServiceIntegrationMock`. Give it a stable `mockedServiceName`, record every invocation, and return configured expectations:
+
+```groovy
+@Singleton
+@Replaces(CatalogClient)
+class CatalogClientMock extends AbstractServiceIntegrationMock implements CatalogClient {
+  CatalogClientMock(ObjectMapper mapper) { super(mapper) }
+
+  @Override
+  String getMockedServiceName() { 'CatalogClient' }
+
+  @Override
+  ProductDetails getProduct(UUID id) {
+    execute('getProduct', [id: id], ProductDetails) { null }
+  }
+}
+```
+
+Drive and verify it from Gherkin:
+
+```gherkin
+Given I expect service CatalogClient to respond with
+  | getProduct | { "name": "Widget" } |
+When I get a product with id ${product.id}
+And I get the executions of getProduct from service CatalogClient as catalogCalls
+Then the catalogCalls response contains 1 element
+And the catalogCalls response element 0 contains
+  | id | ${product.id} |
+```
+
+Expectation values can use `classpath:/payloads/...`; mock response templates may interpolate invocation arguments. All expectations and execution history are cleared before each scenario. Mock true boundaries (OAuth clients, ESB/message adapters, remote APIs), not repositories or generated services.
+
+### Test-only controller
+
+When a workflow needs an opaque value that the public API intentionally hides (verification code, reset token, captured event), add a controller under `src/test` extending `MicronautTestController` or `SpringTestController`, and expose the smallest read-only endpoint needed by the steps:
+
+```groovy
+@Transactional
+@Controller('/integration')
+class TestController extends MicronautTestController {
+  @Inject UserService userService
+
+  @Get('/users/{userId}/verificationCode')
+  HttpResponse<String> verificationCode(UUID userId) {
+    HttpResponse.ok(userService.get(userId).verificationCode)
+  }
+}
+```
+
+Because it lives in test sources, it cannot ship in the production artifact. Use it only to bridge otherwise inaccessible state; test public behavior through public endpoints.
+
+### Coverage checklist
+
+For each generated model or custom workflow, cover:
+
+- happy-path CRUD/custom action and persisted response;
+- bean-validation boundaries and structured `errors` assertions;
+- anonymous, allowed, owner/inferred-permission, and forbidden access;
+- relationship add/replace/remove and model drilling where relevant;
+- behaviour side effects (hashing/defaults/events) through observable results;
+- external calls through expectations plus captured argument assertions;
+- transaction/database constraints using the real test database;
+- scenario isolation (each scenario passes alone and in the full suite).
+
+Do not assert secrets or irreversible transformed values directly when the public contract hides them. Assert that the clear text is absent, authenticate through the real workflow, inspect an intentionally test-only endpoint, or verify downstream calls instead.
 
 ---
 
