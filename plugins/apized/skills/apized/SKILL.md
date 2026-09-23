@@ -901,7 +901,7 @@ Requires a `shedlock` table in the database (created by your Flyway/Liquibase mi
 
 ## Test Module (`micronaut-test` / `spring-test`)
 
-Use the Apized test module for HTTP-level Cucumber integration tests. It boots the real application, discovers generated model services, sends requests with REST Assured, understands `@Apized(scope = ...)` hierarchies, and resets the database and registered service mocks before each scenario. Prefer a real disposable database over repository mocks; the Auth service is the reference pattern.
+Use the Apized test module for HTTP-level Cucumber integration tests. It boots the real application, discovers generated model services, sends requests with REST Assured, understands `@Apized(scope = ...)` hierarchies, and resets the database and registered service mocks before each scenario. Prefer a real disposable database over repository mocks.
 
 ### Recommended test layout
 
@@ -932,7 +932,7 @@ dependencies {
 }
 ```
 
-The runner used by Auth is:
+The Groovy runner is:
 
 ```groovy
 package com.yourcompany.integration
@@ -956,6 +956,81 @@ class IntegrationTests {}
 
 JUnit Vintage must remain available because `@RunWith(Cucumber)` is a JUnit 4 runner; the Apized test module normally provides it transitively.
 
+### Java + Micronaut migration recipe
+
+Use Java 21 with Gradle 8.5 or newer. Add the test module and Java annotation processor explicitly so Micronaut can discover concrete Java test beans:
+
+```gradle
+dependencies {
+  testImplementation "org.apized:micronaut-test:$apizedVersion"
+  testAnnotationProcessor "io.micronaut:micronaut-inject-java"
+}
+```
+
+Keep the Java runner in the test source set and constrain feature discovery to the module's own `src/test/resources/features` directory:
+
+```java
+package com.yourcompany.integration;
+
+import io.cucumber.junit.Cucumber;
+import io.cucumber.junit.CucumberOptions;
+import io.micronaut.test.extensions.junit5.annotation.MicronautTest;
+import org.junit.runner.RunWith;
+
+@MicronautTest
+@RunWith(Cucumber.class)
+@CucumberOptions(
+    features = "classpath:features",
+    glue = {"org.apized", "com.yourcompany"},
+    plugin = {"pretty", "html:target/features"})
+public class IntegrationTests {}
+```
+
+The `org.apized` glue remains required for framework steps and lifecycle hooks; add the application's package for its custom steps. Do not point `features` at a repository-wide directory, because a module must not accidentally execute another module's feature files.
+
+Concrete Java test beans must use Micronaut bean annotations such as `@Singleton` or `@Controller` and must have generated Micronaut bean metadata. Replace the concrete production resolver—not the `UserResolver` interface—with the test resolver:
+
+```java
+import io.micronaut.context.annotation.Replaces;
+import jakarta.inject.Singleton;
+
+@Singleton
+@Replaces(DBUserResolver.class)
+public class TestUserResolver extends AbstractMicronautUserResolverMock {
+  // Provide the test users required by this module's features.
+}
+```
+
+When a scenario needs to inspect test state, expose only opaque test support through a test-only controller. Extend `MicronautTestController` and use the `/integration` prefix: built-in login and reset support also requires that prefix.
+
+```java
+import io.micronaut.http.annotation.Controller;
+import io.micronaut.http.annotation.Get;
+
+@Controller("/integration")
+public class IntegrationTestController extends MicronautTestController {
+  @Get("/reset-state")
+  public void resetOpaqueState() {
+    reset();
+  }
+
+  @Get("/verification-state")
+  public Object readOpaqueVerificationState() {
+    return verificationState();
+  }
+}
+```
+
+Keep these endpoints minimal and test-only: return opaque reset or verification data rather than exposing domain internals. Use the concrete reset and verification accessors supplied by the module version in use when their names differ.
+
+| Symptom | Check |
+| --- | --- |
+| Cucumber runner or built-in steps are missing | Use `@RunWith(Cucumber.class)`, retain JUnit Vintage, and include `org.apized` plus the application package in `glue`. |
+| Java replacement is ignored or unavailable | Add `testAnnotationProcessor "io.micronaut:micronaut-inject-java"`; annotate concrete test beans with `@Singleton`/`@Controller` so Micronaut generates bean metadata; replace `DBUserResolver.class`, not `UserResolver`. |
+| `/integration` endpoints return 404 | Keep the test controller in the test source set, annotate it with `@Controller("/integration")`, and extend `MicronautTestController`. |
+| Features from another module run or local features are not found | Use `features = "classpath:features"` and keep this module's files under `src/test/resources/features`. |
+| Gradle or Java startup/processor failures | Run Java 21 with Gradle 8.5 or newer. |
+
 Optional `src/test/resources/cucumber.properties` for IDE/CLI discovery:
 
 ```properties
@@ -963,7 +1038,7 @@ cucumber.glue=org.apized,com.yourcompany
 cucumber.plugin=pretty
 ```
 
-Run all tests with `./gradlew test` (or `./gradlew :server:test` in a multi-project build). To support CI/test partitioning, a project can pass exclusions into Gradle and map them to `test.exclude(...)`, as Auth does with `-PexcludeTests=...`.
+Run all tests with `./gradlew test` (or `./gradlew :server:test` in a multi-project build). To support CI/test partitioning, a project can pass exclusions into Gradle and map them to `test.exclude(...)`, for example with `-PexcludeTests=...`.
 
 ### Test profile and real database
 
@@ -1010,7 +1085,7 @@ class TestUserResolver extends AbstractMicronautUserResolverMock {
 
 Use `@Component`/`@Primary` and `AbstractSpringUserResolverMock` for Spring. The base mock assigns missing UUIDs and publishes the alias map into the integration context, so `Given I login as alice` obtains a token for that exact test user.
 
-If users are themselves persisted during scenarios, follow Auth's dynamic pattern instead of keeping only a static map:
+If users are themselves persisted during scenarios, use a dynamic fixture pattern instead of keeping only a static map:
 
 1. Replace the production resolver, but inject/delegate to production conversion logic where appropriate.
 2. Keep both alias-to-user and UUID-to-user maps in the inherited mock.
@@ -1104,7 +1179,7 @@ class ProductSteps extends AbstractSteps {
 }
 ```
 
-Use a helper like Auth's `executeAs(user, closure)` for fixture creation that temporarily switches identity, and restore the old token in `finally`. Keep feature text business-oriented; do not duplicate generic HTTP mechanics in every project step.
+Use an `executeAs(user, closure)` helper for fixture creation that temporarily switches identity, and restore the old token in `finally`. Keep feature text business-oriented; do not duplicate generic HTTP mechanics in every project step.
 
 For stateful protocols (for example passkeys), keep simulator state as instance fields so it is per scenario, while the framework runner/context stay static. Store parsed intermediate responses by alias and use the same simulator/key material throughout the scenario.
 
