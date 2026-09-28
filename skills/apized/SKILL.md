@@ -992,7 +992,7 @@ class IntegrationTests extends SpringBootTestServer { }
 
 Java versions, Gradle versions, JUnit Vintage, `@MicronautTest`, and test annotation processors depend on the application's tested toolchain; they are not universal Apized framework requirements. If a project uses a JUnit 4 `@RunWith(Cucumber.class)` runner, retain JUnit Vintage as required by that project's dependency graph. Record the exact configuration as a reproducible project recipe rather than presenting it as framework-wide guidance.
 
-For example, a Micronaut project that needs concrete Java test beans may require a test annotation processor:
+For Micronaut, keep the runner on `MicronautTestServer`. Concrete Java test beans—including resolvers, controllers, mocks, and behaviours—need a Micronaut bean annotation such as `@Singleton` or `@Controller` **and** generated bean metadata. Add the Java test annotation processor:
 
 ```gradle
 dependencies {
@@ -1001,18 +1001,20 @@ dependencies {
 }
 ```
 
-Keep feature discovery scoped to the module's own `src/test/resources/features` directory so it cannot execute another module's feature files. Concrete Java test beans must use Micronaut bean annotations such as `@Singleton` or `@Controller` and need generated Micronaut bean metadata. Replace the concrete production resolver—not the `UserResolver` interface—with the test resolver:
+Replace the **concrete** production resolver class (for example, `SharedAuthUserResolver.class` or `DBUserResolver.class`), never `UserResolver.class`:
 
 ```java
 import io.micronaut.context.annotation.Replaces;
 import jakarta.inject.Singleton;
 
 @Singleton
-@Replaces(DBUserResolver.class)
+@Replaces(SharedAuthUserResolver.class) // or DBUserResolver.class in this application
 public class TestUserResolver extends AbstractMicronautUserResolverMock {
   // Provide the test users required by this module's features.
 }
 ```
+
+If Java test-bean discovery or replacement remains problematic, place test-only beans in the supported Groovy layout under `src/test/groovy`; Groovy test beans are the reliable fallback. Keep feature discovery scoped to the module's own `src/test/resources/features` directory so it cannot execute another module's feature files.
 
 When a scenario needs to inspect test state, expose only opaque test support through a test-only controller. Extend `MicronautTestController` and use the `/integration` prefix: built-in login and reset support also requires that prefix.
 
@@ -1039,7 +1041,7 @@ Keep these endpoints minimal and test-only: return opaque reset or verification 
 | Symptom | Check |
 | --- | --- |
 | Cucumber runner or built-in steps are missing | Include `org.apized` plus the application package in `glue`; use the runner supported by the project's Cucumber setup. A JUnit 4 `@RunWith(Cucumber.class)` setup also needs JUnit Vintage. |
-| Java replacement is ignored or unavailable | For Micronaut projects using Java test beans, add `testAnnotationProcessor "io.micronaut:micronaut-inject-java"`; annotate concrete test beans with `@Singleton`/`@Controller` so Micronaut generates bean metadata; replace `DBUserResolver.class`, not `UserResolver`. |
+| Java replacement is ignored or unavailable | Keep the runner on `MicronautTestServer`; add `testAnnotationProcessor "io.micronaut:micronaut-inject-java"`; annotate every concrete Java test bean with `@Singleton`/`@Controller`; replace `SharedAuthUserResolver.class` or `DBUserResolver.class`, never `UserResolver.class`. If discovery is still unreliable, move test-only beans to `src/test/groovy`. |
 | `/integration` endpoints return 404 | Keep the test controller in the test source set, annotate it with `@Controller("/integration")`, and extend `MicronautTestController`. |
 | Features from another module run or local features are not found | Scope feature discovery to this module's `src/test/resources/features` directory. |
 | Gradle or Java startup/processor failures | Use the Java and Gradle versions verified by the application; capture the working versions in that project's test recipe. |
@@ -1052,6 +1054,18 @@ cucumber.plugin=pretty
 ```
 
 Run all tests with `./gradlew test` (or `./gradlew :server:test` in a multi-project build). To support CI/test partitioning, a project can pass exclusions into Gradle and map them to `test.exclude(...)`, for example with `-PexcludeTests=...`.
+
+### Docker/Testcontainers daemon compatibility
+
+If Testcontainers fails because the Docker daemon requires a newer API version than the test JVM negotiates, set the API version on the Gradle test executor:
+
+```gradle
+tasks.withType(Test).configureEach {
+  systemProperty("api.version", "1.40")
+}
+```
+
+Use the value required by the target Docker/Testcontainers environment; `1.40` is a known compatibility setting, not a universal framework default.
 
 ### Test profile and real database
 
