@@ -125,7 +125,7 @@ public class Product extends BaseModel {
 public class Department extends BaseModel { ... }
 ```
 
-Generated controller routes use the pluralized, lower-camel model name: `GET /products`, `GET /products/{id}`, `POST /products`, `PUT /products/{id}`, and `DELETE /products/{id}` for enabled operations. A scoped `Department` under `Organization` is generated under `/organizations/{organizationId}/departments`. Although `scope` is declared as an array and the processor computes candidate paths, the current controller templates bind only the first generated path; do not rely on multiple scope alternatives being exposed simultaneously.
+Generated controller routes use the pluralized, lower-camel model name: `GET /products`, `GET /products/{id}`, `POST /products`, `PUT /products/{id}`, and `DELETE /products/{id}` for enabled operations. Inner capitals are preserved, so `ApiKey` generates `/apiKeys`, **not** `/api-keys`. Generated source may declare `POST /apiKeys/`, but the route accepts `/apiKeys`; compile and inspect the generated controller or OpenAPI rather than guessing a route. A scoped `Department` under `Organization` is generated under `/organizations/{organizationId}/departments`. Although `scope` is declared as an array and the processor computes candidate paths, the current controller templates bind only the first generated path; do not rely on multiple scope alternatives being exposed simultaneously.
 
 ## Service Extensions
 
@@ -224,7 +224,8 @@ public void preUpdate(Execution<Order> execution, UUID id, Order input) {
     input.setPassword(BCrypt.hashpw(input.getPassword(), BCrypt.gensalt()));
   }
 
-  // Force a computed field to be persisted even if client didn't send it
+  // Force a computed field to be persisted even if client didn't send it.
+  // Use the serializer/property name, not a database column name.
   input.setVerificationCode(generateCode());
   input._getModelMetadata().getTouched().add("verificationCode");
 
@@ -235,6 +236,21 @@ public void preUpdate(Execution<Order> execution, UUID id, Order input) {
   }
 }
 ```
+
+### Generated CRUD and behaviour-owned fields
+
+Generated create/update flows persist only properties tracked as touched. If a `preCreate` or `preUpdate` behaviour supplies a value that was not in the client body, set the value **and** mark its Java/serialized property name as touched. For several values, `addAll` keeps the intent explicit:
+
+```java
+@Override
+public void preCreate(Execution<ApiKey> execution, ApiKey input) {
+  input.setUserId(ApizedContext.getSecurity().getUser().getId());
+  input.setSecretHash(hash(generateOpaqueSecret()));
+  input._getModelMetadata().getTouched().addAll(List.of("userId", "secretHash"));
+}
+```
+
+Do not use `user_id`, `secret_hash`, or another database-column name in `touched`; those values are ignored because touched fields are model/serializer property names. Exercise this through generated HTTP CRUD rather than only unit-testing the behaviour: the generated controller/service path runs validation, permissions, deserialization, and the behaviour pipeline.
 
 ### Behaviour execution order
 
@@ -441,10 +457,16 @@ ApizedContext.getSecurity().getUser().isAllowed("myapp.product.create");
 **Inferred (runtime) permissions** via three mechanisms:
 
 ### 1. @Owner
+For server-assigned ownership on a generated create endpoint, use a scalar owner ID. A relationship field such as `@ManyToOne User user`, even with `@JsonProperty(READ_ONLY)`, can cause Micronaut ModelSerde to bind a caller-provided UUID into `User` and reject the request with HTTP 400 **before** `preCreate` runs.
+
 ```java
-@Owner(actions = { Action.GET }, permissions = @Permission(action = Action.UPDATE, fields = "owner"))
-private UUID owner;
+@JsonIgnore                       // never supplied by or returned to callers
+@Owner(actions = { Action.GET })
+@Column(name = "user_id")         // explicit when the naming strategy is uncertain
+private UUID userId;
 ```
+
+Set `userId` from the authenticated user in `preCreate` and mark `"userId"` touched. This scalar mapping normally uses the same snake-case `user_id` column as a relationship would, but verify or explicitly set `@Column(name = "user_id")` when changing mappings or using a non-default naming strategy. Use a relationship owner only after verifying that its exact framework/serde mapping safely rejects client input without attempting relationship deserialization.
 
 The `fields` value in `@Permission` supports a `"field.VALUE"` syntax to make permissions conditional on a field's current value:
 
@@ -459,6 +481,104 @@ The `fields` value in `@Permission` supports a `"field.VALUE"` syntax to make pe
 )
 private UUID owner;
 ```
+
+### Security-sensitive generated model: one-time API key
+
+Keep ordinary lifecycle operations on generated CRUD, omit UPDATE, and disable automatic audit/events for the secret-bearing model. This Micronaut recipe uses Jackson property annotations and JPA `@Transient` (not the Java `transient` modifier):
+
+```java
+@Entity
+@Getter @Setter
+@Apized(
+  operations = {Action.LIST, Action.GET, Action.CREATE, Action.DELETE},
+  audit = false,
+  event = false
+)
+public class ApiKey extends BaseModel {
+  @NotBlank
+  private String name;
+
+  @JsonIgnore
+  @Owner(actions = {Action.GET, Action.DELETE})
+  @Column(name = "user_id")
+  private UUID userId;
+
+  @JsonIgnore
+  @Column(name = "secret_hash")
+  private String secretHash;
+
+  @Transient
+  @JsonProperty(access = JsonProperty.Access.READ_ONLY)
+  private String key;
+}
+```
+
+```java
+@Singleton
+@Behaviour(
+  model = ApiKey.class,
+  layer = Layer.SERVICE,
+  when = {When.BEFORE, When.AFTER},
+  actions = {Action.CREATE, Action.GET, Action.LIST, Action.DELETE}
+)
+public class ApiKeyBehaviour implements BehaviourHandler<ApiKey> {
+  private final SecureRandom random = new SecureRandom();
+
+  @Override
+  public void preCreate(Execution<ApiKey> execution, ApiKey input) {
+    byte[] bytes = new byte[32];
+    random.nextBytes(bytes);
+    String secret = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    input.setUserId(ApizedContext.getSecurity().getUser().getId());
+    input.setSecretHash(hash(secret));
+    input.setKey(secret);
+    input._getModelMetadata().getTouched().addAll(List.of("userId", "secretHash"));
+  }
+
+  @Override
+  public void postCreate(Execution<ApiKey> execution, ApiKey input, ApiKey output) {
+    // Persistence may return a different instance; copy only for this response.
+    output.setKey(input.getKey());
+  }
+
+  @Override
+  public void postGet(Execution<ApiKey> execution, UUID id, ApiKey output) {
+    output.setKey(null);
+  }
+
+  @Override
+  public void postList(Execution<ApiKey> execution, Page<ApiKey> output) {
+    output.getContent().forEach(it -> it.setKey(null));
+  }
+
+  @Override
+  public void postDelete(Execution<ApiKey> execution, UUID id, ApiKey output) {
+    output.setKey(null);
+  }
+
+  private String hash(String secret) {
+    try {
+      byte[] digest = MessageDigest.getInstance("SHA-256")
+        .digest(secret.getBytes(StandardCharsets.UTF_8));
+      return HexFormat.of().formatHex(digest);
+    } catch (NoSuchAlgorithmException e) {
+      throw new IllegalStateException("SHA-256 unavailable", e);
+    }
+  }
+}
+```
+
+Use `java.security` (`SecureRandom`, `MessageDigest`, `NoSuchAlgorithmException`), `java.nio.charset.StandardCharsets`, and `java.util` (`Base64`, `HexFormat`, `List`, `UUID`) imports; `HexFormat` requires Java 17+. SHA-256 here is for a high-entropy random token, **not** for user passwords. Authentication must hash the presented key using the same encoding, resolve an active persisted key, and fail closed for invalid/revoked keys. Never log the raw key, bearer header, or hash.
+
+`@JsonIgnore` protects response serialization; it does **not** by itself prevent audit/event snapshots from recording secrets or hashes. Keep `audit = false, event = false` for this recipe. If those trails are required, explicitly apply `@AuditIgnore` and `@EventIgnore` to both sensitive properties and test all emitted payloads. Publish only deliberately sanitized metadata.
+
+End-to-end validation:
+
+1. Authenticate an authorized creator and `POST /apiKeys` with only `{ "name": "automation" }`. Assert a persisted ID and a one-time `key`, with no `userId` or `secretHash` in the response.
+2. Read the row through test-only support to verify `user_id` and `secret_hash` were persisted; authenticate using the returned key through the real resolver. A direct behaviour unit test cannot prove touched-field persistence.
+3. GET/LIST (including `?fields=key,secretHash,userId`) must never expose the secret or hash. A null or omitted `key` is acceptable on later reads. Enforce owner-scoped LIST with a query/filter or explicit authorization policy; do not assume GET ownership automatically filters every collection.
+4. Verify foreign-owner GET/DELETE, malformed/missing credentials, and client attempts to set `userId`, `secretHash`, or `key` cannot grant access or override server-derived values. DELETE must revoke subsequent authentication; UPDATE must not be exposed.
+5. Repeat secret-return and authorization checks via generated MCP tools, and confirm audit/event/log output contains no sensitive values.
 
 ### 2. PermissionEnricher (model-scoped)
 
@@ -878,6 +998,7 @@ public class DepartmentCreationBehaviour implements BehaviourHandler<Department>
       Employee mgr = new Employee();
       mgr.setId(currentUser);
       input.setManager(mgr);
+      input._getModelMetadata().getTouched().add("manager");
     }
   }
 }
@@ -1092,6 +1213,10 @@ endpoints:
 
 Use the same database family as production so migrations, constraints, native column types, and queries are exercised. The framework test controller truncates non-Flyway tables between scenarios for H2, MySQL, PostgreSQL, Oracle, and SQL Server, then re-runs startup initialization. Do not depend on records created by another scenario; put shared setup in `Background` or startup fixtures.
 
+### Flyway migration safety
+
+Never edit a versioned migration already applied to a shared or reused database, including a reused Testcontainers database. Flyway records its checksum; even simplifying a newly added migration after a local run can cause validation to block application startup and **all** tests. Add a follow-on migration to remove/alter columns or constraints instead. Scenario truncation does not remove Flyway history. Recreate a database only when it is confirmed disposable and owned by the test run; do not repair shared migration history to hide a mismatch.
+
 ### Authentication fixture
 
 For a static set of users, replace the application's resolver and extend the framework mock:
@@ -1121,6 +1246,10 @@ If users are themselves persisted during scenarios, use a dynamic fixture patter
 5. Resolve database users first, then fall back to the inherited in-memory users/anonymous user.
 
 This keeps authentication realistic while making scenario-created identities usable. Reset `inferredPermissions` per resolution; never let inferred permissions leak between requests or scenarios.
+
+### Testing alternate bearer credentials
+
+Some test helpers append an `Authorization` header instead of replacing the default token. A request with two bearer headers can still be authorized by the original/default credential, creating a false-positive API-key or forbidden-access test. For alternate credentials, create a fresh request specification/client with **only** the intended `Authorization: Bearer <api-key>` header, or use a project helper proven to replace the header. Assert both the expected success path and that the original credential is absent; then repeat with an invalid/foreign key to prove the resolver and authorization decision actually used the alternate credential.
 
 ### Built-in Cucumber steps
 
@@ -1164,11 +1293,13 @@ Then the response path "errors" contains 2 elements
 Then the response matches products/widget.json
 ```
 
+The available generic glue varies by the Apized test-module/Cucumber version. In particular, do not assume `/regex/` comparisons or `does not contain` steps are implemented merely because an older example documents them: undefined-step failures mean the project's installed glue does not support that phrase. Inspect the registered steps or run a narrow feature first. Prefer stable fixture matching (`Then the response matches ...`) and explicit positive path/element assertions; add a small project assertion step when a required negative or regex assertion is unavailable.
+
 Important expression rules:
 
 - Refer to stored values with `${alias.id}`, `${alias.roles[0]}`, etc. Do not use `<alias.id>` or `{alias.id}` outside a Scenario Outline example placeholder.
 - DataTable values are evaluated as Groovy-like literals, allowing lists/maps such as `[ '${role.id}' ]` and `[ [ id: '${role.id}' ] ]`.
-- Use `/regex/` for a full regular-expression match; `/.*Not allowed.*/` is typical for variable error text.
+- Regex `/.../` support is version-dependent; verify the installed `org.apized` glue before using it. If unavailable, assert a stable fixture/path or add a focused custom assertion step.
 - Booleans and numeric strings are compared as their response types.
 - Response paths are dot-separated (`errors.0.message`, `content.0.name`), not JSONPath bracket syntax.
 - `_` means the current scalar/object, useful when asserting primitive lists.
@@ -1296,7 +1427,7 @@ For a model `Product` with all five operations enabled, the following MCP tools 
 | `product_update` | UPDATE — with `id`, `it`, `fields` params |
 | `product_delete` | DELETE — with `id` param |
 
-Tool names are `{snake_case_type}_{action}`. Only operations declared in `@Apized(operations = ...)` are generated.
+Tool names are `{snake_case_type}_{action}`. For `ApiKey`, enabled LIST/GET/CREATE/DELETE operations generate `api_key_list`, `api_key_get`, `api_key_create`, and `api_key_delete`. Only operations declared in `@Apized(operations = ...)` are generated. Generated MCP CRUD invokes the same controller/service behaviour pipelines as generated HTTP CRUD; test the generated tool rather than assuming behaviours are bypassed.
 
 ### Authentication
 
@@ -1356,7 +1487,14 @@ public class UserPermissionMcpTools {
 }
 ```
 
-Generated MCP tools initialize `ApizedContext` themselves. A hand-written tool that calls Apized services directly must initialize it with `McpContextInitializer.init()`. Ensure the MCP transport supplies a Bearer token and verify authorization with an integration test: initialization without an `Authorization` header does not populate the Apized user. Generated MCP tools catch exceptions and return `"Error: ..."` strings, so MCP clients must treat that response as a failure rather than a successful domain payload. Choose stable, descriptive tool names and validate tool arguments just as you would validate HTTP input.
+Generated MCP tools initialize `ApizedContext` themselves. A hand-written tool that calls Apized services directly must initialize it with `McpContextInitializer.init()`. Ensure the MCP transport supplies a Bearer token and verify authorization with an integration test: initialization without an `Authorization` header does not populate the Apized user. Generated MCP tools catch exceptions and return `"Error: ..."` strings, so MCP clients and tests must treat that result as a failure rather than a successful domain payload. Choose stable, descriptive tool names and validate tool arguments just as you would validate HTTP input.
+
+For security-sensitive CRUD, validate MCP separately from HTTP:
+
+- create with an authorized bearer token and assert a valid payload rather than an `Error:` string;
+- verify the one-time secret is present only in the create result, then absent from GET/LIST results and error text;
+- reject missing, malformed, foreign-owner, and revoked credentials; and
+- verify disabled operations (for example `api_key_update`) are not registered.
 
 ### Disabling MCP for a specific model
 
